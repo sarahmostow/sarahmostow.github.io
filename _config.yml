@@ -1,2 +1,8 @@
-name: Sarah Mostow
+title: Sarah Mostow
+email: email@example.com
+description: >
+  Prospective PhD student in statistics interested in Empirical Bayes
+  and multiple testing.
 theme: minima
+
+markdown: kramdown
