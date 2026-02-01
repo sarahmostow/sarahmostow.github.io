@@ -3,6 +3,6 @@ email: email@example.com
 description: >
   Prospective PhD student in statistics interested in Empirical Bayes
   and multiple testing.
-theme: minima
+theme: jekyll-theme-cayman
 
 markdown: kramdown
