@@ -4,5 +4,5 @@ description: >
   Prospective PhD student in statistics interested in Empirical Bayes
   and multiple testing.
 theme: jekyll-theme-cayman
-
-markdown: kramdown
+kramdown:
+  math_engine: mathjax
