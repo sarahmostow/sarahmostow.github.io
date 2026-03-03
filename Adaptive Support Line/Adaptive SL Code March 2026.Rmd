@@ -1,0 +1,1546 @@
+---
+title: "Code for Adaptive Support Line Simulations and Data Analysis - 2026 update"
+output: html_notebook
+---
+
+# Helper Functions
+
+### Simulate p-values
+
+```{r}
+library(MASS)
+
+freq_simulate_correlated_pvals <- function(m, rho, pi0=0.75) {
+  "
+  Uses frequentist methadology to simulate m equicorrelated
+  p-values with correlation coefficient rho.
+  Alternating configuration.
+  NOTE: m and m0 (m0 = pi0 * m) should both be multiples of 4
+  
+  "
+  m0 <- pi0 * m
+  alt_mu_values <- c(5 * (1:4) / 4)
+  rep_count <- (m - m0) / 4
+  mu_vec <- c(rep(0, m0), rep(alt_mu_values, rep_count))
+  Sigma <- matrix(rho, nrow = m, ncol = m)
+  diag(Sigma) <- 1
+  Y <- mvrnorm(n = 1, mu = mu_vec, Sigma = Sigma)
+  pvals <- pnorm(Y, lower.tail = FALSE)
+  return(list(pvals = pvals, is_null = (mu_vec == 0), mu_vals = mu_vec))
+}
+
+freq_simulate_pvals <- function(m, pi0=0.75, k=5) {
+  "
+  Uses frequentist methodology to simulate m independent p-values
+  For alternating config: use k=5 and alt_mu_values <- c(k * (1:4) / 4)
+  For all-at-5 config: use alt_mu_values <- c(5, 5, 5, 5)
+  
+  "
+  m0 <- pi0 * m
+  alt_mu_values <- c(k * (1:4) / 4)
+  #alt_mu_values <- c(5, 5, 5, 5)
+  rep_count <- (m - m0) / 4
+  mu_vec <- c(rep(0, m0), rep(alt_mu_values, rep_count))
+  Y <- rnorm(m, mean = mu_vec)
+  pvals <- pnorm(Y, lower.tail = FALSE)
+  return(list(pvals = pvals, is_null = (mu_vec == 0), mu_vals = mu_vec))
+}
+```
+
+### Calculate lfdr and bfdr
+
+```{r}
+freq_lfdr <- function(pval, is_null) {
+  "
+  True frequentist bfdr
+  
+  "
+  if (is_null) return(1) else return(0)
+}
+
+e_bayes_lfdr <- function(pval, pi0, k = 5) {
+  "
+  True Bayesian lfdr for alternating configuration.
+  Use k=5 to replicate figures from  paper.
+  "
+  z <- qnorm(1 - pval)
+  mu_vals <- k * (1:4) / 4  
+  num <- sapply(z, function(z_i) mean(dnorm(z_i - mu_vals)))
+  f1 <- num / dnorm(z)
+  lfdr <- pi0 / (pi0 + (1 - pi0) * f1)
+  return(lfdr)
+}
+
+e_bayes_lfdr_all_at_5 <- function(pval, pi0, mu) {
+  "
+  True Bayesian lfdr for all-at-5 configuration
+  Use mu=5 to replicate figures from paper.
+  "
+  z <- qnorm(1-pval)  
+  num <- dnorm(z - mu)   
+  denom <- dnorm(z)       
+  f1 <- num / denom 
+  l <- pi0 / (pi0 + (1 - pi0) * f1)
+  return(l)
+}
+
+f_hat <- function(pvals, t) {
+  "
+  grenander estimate of marginal density evaluated
+  at t between 0 and 1
+  
+  "
+  p_sorted <- sort(pvals)
+  Fm <- ecdf(c(0,pvals))
+  g <- grenander(Fm, "decreasing")
+  x_knots <- g$x.knots
+  f_knots <- g$f.knots
+   idx <- findInterval(
+    t,
+    x_knots,
+    left.open = TRUE, 
+    all.inside = TRUE
+  )
+
+  f_hat <- f_knots[idx]
+
+  return(f_hat)
+}
+
+
+lfdr_est <- function(f_of_p, pi0_hat) {
+  "
+  estimate lfdr for a single p value using marginal density
+  "
+  lfdr <- pi0_hat / f_of_p 
+  return(lfdr)
+}
+
+
+```
+
+### FDR & bFDR Procedures
+
+```{r}
+support_line <- function(pvals, alpha) {
+  "
+  Support line proceudre at tolerance level alpha
+  
+  "
+  m <- length(pvals)
+  p_sorted <- sort(pvals)
+  p_ext <- c(0, p_sorted)
+  scores <- p_ext - (alpha * 0:m) / m
+  k <- which.min(scores) -1
+  if (k == 0) return(integer(0))
+  threshold <- p_sorted[k]
+  return(which(pvals <= threshold))
+}
+
+bh <- function(pvals, q = 0.05) {
+  "
+  Benjamini-Hochberg procedure at tolerance level q
+  
+  "
+  adj <- p.adjust(pvals, method = "BH")
+  return(which(adj <= q))
+}
+
+storey_support_line <- function(pvals, alpha, lambda = 0.5) {
+  "
+  Adaptive SL procedure using Storey estimator.
+  Differs from standard SL by restricting to p-values
+  ≤ lambda and applying SL to the restricted set.
+  
+  "
+  m <- length(pvals)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  q <- alpha / pi0_hat
+  restricted_idx <- which(pvals <= lambda)
+  p_restricted <- pvals[restricted_idx]
+  m_restricted <- length(p_restricted)
+  if (m_restricted == 0) return(integer(0))
+  p_sorted <- sort(p_restricted)
+  p_ext <- c(0, p_sorted)
+  scores <- p_ext - (q * 0:m_restricted / m)
+  best_idx <- which.min(scores) - 1
+  if (best_idx < 1) return(integer(0))
+  threshold <- p_sorted[best_idx]
+  return(which((pvals <= threshold) & (pvals <= lambda)))
+}
+
+```
+
+### Estimate $\hat \pi_0$
+
+```{r}
+
+lsl_pi0 <- function(pvals) {
+  "
+  LSL estimator
+  
+  "
+  m <- length(pvals)
+  p_sorted <- sort(pvals)
+  S <- (1 - p_sorted) / (m + 1 - seq_len(m))
+  for (j in 2:m) {
+    if (S[j] < S[j - 1]) {
+      S_j <- S[j]
+      m0_hat <- min(1 / S_j + 1, m)
+      return(m0_hat/m)
+    }
+  }
+  return(1)
+}
+
+storey_pi0 <- function(p_values, lambda = 0.5) {
+  "
+  Storey estimator
+  
+  "
+  m <- length(p_values)
+  pi0_hat <- (1 + sum(p_values > lambda)) / ((1 - lambda) * m)
+  return(pi0_hat)
+}
+
+lambda_hat <- function(pvals, q, delta=0.01) {
+  "
+  Calculate lambda for Adaptive Storey procedure
+  as in Gao 2025
+  
+  "
+  m <- length(pvals)
+  j_seq <- seq(0, floor((1 - q) / delta), by=1)
+  lambda_seq <- j_seq * delta + q 
+  l_prev <- storey_pi0(pvals, lambda_seq[1])
+  for (i in 2:length(lambda_seq)) {
+    lambda_curr <- lambda_seq[i]
+    l_curr <- storey_pi0(pvals, lambda_curr)
+    # Stopping condition
+    if (lambda_curr >= 0.8 || l_curr >= l_prev) {
+      return(lambda_curr)
+    }
+    
+    l_prev <- l_curr
+  }
+  return(lambda_seq[length(lambda_seq)])
+}
+```
+
+# Numerical Simulations
+
+### FIGURE 3: bFDR vs q (independent p-values)
+
+```{r}
+set.seed(123)
+library(MASS)
+library(ggplot2)
+library(dplyr)
+
+"
+To generate the plots from the paper, change the alt_mu_values variable
+in freq_simulate_pvals function to obtain p-values for either all-at-5
+or alternating configurations.
+"
+
+m <- 64
+N <- 10000
+pi0 <- 0.5
+q_vals <- seq(0, 0.5, by = 0.1)
+procs <- c("SL", "Oracle", "TSSL (q)", "TSSL (q')", "Storey (1/2)", "Storey (q)", "LSL", "AS (0.1)", "AS (0.01)")
+results <- matrix(0, nrow = length(q_vals), ncol = length(procs))
+
+for (i in seq_along(q_vals)) {
+  q <- q_vals[i]
+  proc_res <- matrix(NA, nrow = N, ncol = length(procs))
+  
+  for (j in 1:N) {
+    sim <- freq_simulate_pvals(m, pi0)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    m0 <- m * pi0
+
+      ## Procedure 1: SL at level q
+      rejs <- support_line(pvals, q)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 1] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 1] <- 0}
+      
+      ##Procedure 2: Oracle
+      rejs <- support_line(pvals, q * m / m0)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 2] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 2] <- 0}
+      
+      ## Procedure 3: TSSL at level q
+      rejs1 <- support_line(pvals, q)
+      m0_hat <- m - length(rejs1)
+      if (m0_hat == 0) {
+        max_idx <- which.max(pvals)
+        proc_res[j, 3] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+      else {
+        rejs <- support_line(pvals, q * m / m0_hat)
+        if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 3] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+        else {proc_res[j, 3] <- 0}
+      }
+      
+      ### Procedure 4: TSSL at level q'
+      q_prime <- q / (1+q)
+      rejs1 <- support_line(pvals, q_prime)
+      m0_hat <- m - length(rejs1)
+      if (m0_hat == 0) {
+        max_idx <- which.max(pvals)
+        proc_res[j, 4] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+      else {
+        rejs <- support_line(pvals, q_prime * m / m0_hat)
+        if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 4] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+        else {proc_res[j, 4] <- 0}
+      }
+            
+      ## Procedure 5: Storey 1/2
+      lambda <- 0.5
+      pi0_hat <- storey_pi0(pvals)
+      rejs <- storey_support_line(pvals, q)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 5] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 5] <- 0}
+      
+      ## Procedure 6: Storey q
+      lambda <- q
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 6] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 6] <- 0}
+    
+      ## Procedure 7: LSL
+      pi0_hat <- lsl_pi0(pvals)
+      rejs <- support_line(pvals, q / pi0_hat)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 7] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 7] <- 0}
+      
+      ## Procedure 8: AS using delta = 0.1
+      lambda <- lambda_hat(pvals, q, 0.1)
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 8] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 8] <- 0}
+      
+      ## Procedure 9: AS using delta = 0.01
+      lambda <- lambda_hat(pvals, q, 0.01)
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 9] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 9] <- 0}
+  
+  # Store means across 10,000 simulations
+  avg_lfdrs <- colMeans(proc_res, na.rm = TRUE)
+  results[i, ] <- colMeans(proc_res, na.rm = TRUE)
+}
+}
+
+
+# Convert to data frame for plotting
+df <- data.frame(
+  q = rep(q_vals, each = length(procs)),
+  method = factor(rep(procs, times = length(q_vals))),
+  lfdr = as.vector(t(results))
+)
+
+ggplot(
+  df %>% dplyr::filter(!method %in% c("TSSL (q')", "AS (0.01)")),
+  aes(x = q, y = lfdr, color = method, linetype = method)
+) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +  # slightly thinner + transparency
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "black") +
+  scale_color_manual(
+    values = c(
+      "SL" = "#1b9e77",
+      "Oracle" = "#d95f02",
+      "TSSL (q)" = "#7570b3",
+      "Storey (1/2)" = "#e7298a",
+      "Storey (q)" = "#66a61e",
+      "LSL" = "#e6ab02",
+      "AS (0.1)" = "#a6761d"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "SL" = "solid",
+      "Oracle" = "dashed",
+      "TSSL (q)" = "dotdash",
+      "Storey (1/2)" = "longdash",
+      "Storey (q)" = "twodash",
+      "LSL" = "dotted",
+      "AS (0.1)" = "F1"
+    )
+  ) +
+  labs(
+    x = "tolerance level q",
+    y = "bFDR",
+    color = "Procedure",
+    linetype = "Procedure"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(aspect.ratio = 1/1.3) +
+  theme(
+    aspect.ratio = 1/1.3,
+    legend.position = "right",
+    legend.key.size = unit(0.4, "cm"),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11)
+  )
+```
+
+### FIGURE 4a: bFDR vs $\rho$ (dependent p-values)
+
+```{r}
+set.seed(123)
+library(MASS)
+library(ggplot2)
+m <- 64
+q <- 0.2
+N <- 10000
+pi0 <- 0.75
+rho_vals <- seq(0, 1, by = 0.1)
+procs <- c("SL", "Oracle", "TSSL (q)", "TSSL (q')", "Storey (1/2)", "Storey (q)", "LSL", "AS (0.1)", "AS (0.01)")
+num_proc <- length(procs)
+
+results <- matrix(0, nrow = length(rho_vals), ncol = num_proc)
+
+for (i in seq_along(rho_vals)) {
+  rho <- rho_vals[i]
+  proc_res <- matrix(NA, nrow = N, ncol = num_proc)
+  
+  for (j in 1:N) {
+    sim <- freq_simulate_correlated_pvals(m, rho, pi0)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    m0 <- m * pi0
+
+      ## Procedure 1: SL at level q
+      rejs <- support_line(pvals, q)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 1] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 1] <- 0}
+      
+      ##Procedure 2: Oracle
+      rejs <- support_line(pvals, q * m / m0)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 2] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 2] <- 0}
+      
+      ## Procedure 3: TSSL at level q
+      rejs1 <- support_line(pvals, q)
+      m0_hat <- m - length(rejs1)
+      if (m0_hat == 0) {
+        max_idx <- which.max(pvals)
+        proc_res[j, 3] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+      else {
+        rejs <- support_line(pvals, q * m / m0_hat)
+        if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 3] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+        else {proc_res[j, 3] <- 0}
+      }
+      
+      ### Procedure 4: TSSL at level q'
+      q_prime <- q / (1+q)
+      rejs1 <- support_line(pvals, q_prime)
+      m0_hat <- m - length(rejs1)
+      if (m0_hat == 0) {
+        max_idx <- which.max(pvals)
+        proc_res[j, 4] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+      else {
+        rejs <- support_line(pvals, q_prime * m / m0_hat)
+        if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 4] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+        }
+        else {proc_res[j, 4] <- 0}
+      }
+            
+      ## Procedure 5: Storey 1/2
+      lambda <- 0.5
+      pi0_hat <- storey_pi0(pvals)
+      rejs <- storey_support_line(pvals, q)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 5] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 5] <- 0}
+      
+      ## Procedure 6: Storey q
+      lambda <- q
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 6] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 6] <- 0}
+    
+      ## Procedure 7: LSL
+      pi0_hat <- lsl_pi0(pvals)
+      rejs <- support_line(pvals, q / pi0_hat)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 7] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 7] <- 0}
+      
+      ## Procedure 8: AS using delta = 0.1
+      lambda <- lambda_hat(pvals, q, 0.1)
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 8] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 8] <- 0}
+      
+      ## Procedure 9: AS using delta = 0.01
+      lambda <- lambda_hat(pvals, q, 0.01)
+      pi0_hat <- storey_pi0(pvals, lambda)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) {
+        max_idx <- rejs[which.max(pvals[rejs])]
+        proc_res[j, 9] <- freq_lfdr(pvals[max_idx], is_null[max_idx])
+      }
+      else {proc_res[j, 9] <- 0}
+  
+  }
+
+  avg_lfdrs <- colMeans(proc_res, na.rm = TRUE)
+  results[i, ] <- colMeans(proc_res, na.rm = TRUE)
+}
+
+df <- data.frame(
+  rho = rep(rho_vals, each = num_proc),
+  method = factor(rep(procs, times = length(rho_vals))),
+  lfdr = as.vector(t(results))
+)
+
+ggplot(df, aes(x = rho, y = lfdr, color = method)) +  # TRUE for TSSL, FALSE otherwise
+  geom_line(size = 1) +
+  labs(x = expression(rho),
+       y = "bFDR",
+       color = "Procedure") +
+  theme_minimal(base_size = 14)
+```
+
+### FIGURE 4b: Distribution of $\hat \pi_0$ for different values of $\rho$
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+m <- 64
+q <- 0.2
+pi0 <- 0.75
+N <- 10000
+
+pi0_hat_box_plots <- function(m, q, pi0, N)
+{  
+  rho_vals <- seq(0, 1, by = 0.25)
+  results <- data.frame()
+  
+  for (rho in rho_vals) {
+    for (i in 1:N) {
+      sim <- freq_simulate_correlated_pvals(m, rho, pi0)
+      pvals <- sim$pvals
+  
+      # Storey 1/2
+      pi0_hat_storey <- storey_pi0(pvals)
+      
+      # Storey q
+      pi0_hat_storey_q <- storey_pi0(pvals, q)
+  
+      # TSSL
+      rejs1 <- support_line(pvals, q)
+      m0_hat <- m - length(rejs1)
+      pi0_hat_tssl <- m0_hat / m
+      
+      #AS (0.1)
+      lambda <- lambda_hat(pvals, q, 0.1)
+      pi0_hat_AS_01 <- storey_pi0(pvals, lambda)
+      
+      #AS (0.01)
+      lambda <- lambda_hat(pvals, q, 0.01)
+      pi0_hat_AS_001 <- storey_pi0(pvals, lambda)
+      
+      #LSL
+      pi0_hat_lsl <- lsl_pi0(pvals)
+      
+      results <- rbind(results,
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_tssl,
+          method = "TSSL (q)"
+        ),
+        
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_lsl,
+          method = "LSL"
+        ),   
+
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_AS_01,
+          method = "AS (0.1)"
+        ),
+        
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_AS_001,
+          method = "AS (0.01)"
+        ),
+        
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_storey_q,
+          method = "Storey (q)"
+        ),  
+        
+        data.frame(
+          rho = rho,
+          pi0_hat = pi0_hat_storey,
+          method = "Storey (1/2)"
+        )
+      )
+    }
+  }
+  
+  results$method <- factor(
+    results$method,
+    levels = c("AS (0.01)", "AS (0.1)", "LSL", "Storey (1/2)", "Storey (q)", "TSSL (q)")
+  )
+  return(results)
+  }
+
+results <- pi0_hat_box_plots(m, q, pi0, N)
+method_colors <- c(
+  "AS (0.01)"   = "#F8766D",  
+  "AS (0.1)"    = "#D39200",  
+  "LSL"         = "#93AA00", 
+  "Storey (q)"= "#619CFF",  
+  "Storey (1/2)"  = "#00B9E3",  
+  "TSSL (q)"    = "#FF00A5"   
+)
+
+p <- ggplot(results, aes(x = factor(rho), y = pi0_hat, fill = method)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    coef = 0
+  ) +
+  scale_fill_manual(values = method_colors, name = "Method") +
+  labs(
+    x = expression(rho),
+    y = expression(hat(pi)[0])
+  ) +
+  coord_cartesian(ylim = c(0, 1.5)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text = element_text(size = 16),  
+    axis.title = element_text(size = 18), 
+  )
+
+print(p)
+
+```
+
+### FIGURE 5: Power comparison table
+
+```{r}
+set.seed(123)
+library(MASS)
+proc_names <- c("SL", "TSSL (q)", "TSSL (q')", "Storey (1/2)", "Storey (q)", "AS (0.01)",  "AS (0.1)", "AS (0.1; 0.5)", "LSL")
+num_procs <- length(proc_names)
+sim_power <- function(m, pi0, q = 0.2, N = 10000) {
+  proc_res <- matrix(0, nrow = N, ncol = num_procs)
+  oracle_res <- c()
+  for (j in 1:N) {
+    sim <- freq_simulate_pvals(m, pi0, k=5)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    m0 <- round(pi0 * m)
+    m1 <- m - m0
+        
+    #Oracle
+    rejs <- if (m0 == 0) 1:m else support_line(pvals, q * m / m0)
+    R1 <- sum(!is_null[rejs])
+    oracle_res[j] <- R1 / m1
+    
+    # Procedure 1: SL at level q
+    rejs <- support_line(pvals, q)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 1] <- R1 / m1
+    
+    #Procedure 2: TSSL at level q
+    rejs1 <- support_line(pvals, q)
+    m0_hat <- m - length(rejs1)
+    rejs <- if (m0_hat == 0) 1:m else support_line(pvals, q * m / m0_hat)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 2] <- R1 / m1
+    
+    # Procedure 3: TSSL at level q'
+    q_prime <- q / (1+q)
+    rejs1 <- support_line(pvals, q_prime)
+    m0_hat <- m - length(rejs1)
+    rejs <- if (m0_hat == 0) 1:m else support_line(pvals, q_prime * m / m0_hat)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 3] <- R1 / m1
+    
+    # Procedure 4: Storey 1/2
+    pi0_hat <- storey_pi0(pvals)
+    rejs <- if (m0 == 0) 1:m else storey_support_line(pvals, q)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 4] <- R1 / m1
+        
+    #Procdure 5: Storey with lambda = q
+    pi0_hat <- storey_pi0(pvals, q)
+    rejs <- if (m0 == 0) 1:m else storey_support_line(pvals, q, q)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 5] <- R1 / m1
+    
+    # Procedure 6: AS with delta = 0.01
+    lambda <- lambda_hat(pvals, q, 0.01)
+    pi0_hat <- storey_pi0(pvals, lambda)
+    rejs <- if (m0 == 0) 1:m else storey_support_line(pvals, q, lambda)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 6] <- R1 / m1
+    
+        
+    #Procedure 7: AS with delta = 0.1
+    lambda <- lambda_hat(pvals, q, 0.1)
+    pi0_hat <- storey_pi0(pvals, lambda)
+    rejs <- if (m0 == 0) 1:m else storey_support_line(pvals, q, lambda)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 7] <- R1 / m1
+    
+    # Procedure 8: AS w/ lambda_hat starting at 0.5 and delta = 0.1
+    lambda <- lambda_hat(pvals, 0.5, 0.1)
+    pi0_hat <- storey_pi0(pvals, lambda)
+    rejs <- if (m0 == 0) 1:m else storey_support_line(pvals, q, lambda)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 8] <- R1 / m1
+    
+    # Procedure 9: LSL
+    pi0_hat <- lsl_pi0(pvals)
+    rejs <- if (m0 == 0) 1:m else support_line(pvals, q / pi0_hat)
+    R1 <- sum(!is_null[rejs])
+    proc_res[j, 9] <- R1 / m1
+  }
+
+  avg_power <- colMeans(proc_res)
+  rel_power <- avg_power / mean(oracle_res)
+  return(rel_power)
+}
+
+m_vals <- c(16, 64, 256)
+pi0_vals <- c(0.25, 0.5, 0.75)
+q <- 0.2
+N <- 10000
+
+results <- list()
+
+for (pi0 in pi0_vals) {
+  mat <- matrix(NA, nrow = num_procs, ncol = length(m_vals))
+  rownames(mat) <- proc_names
+  colnames(mat) <- paste0("m", m_vals)
+  
+  for (mi in seq_along(m_vals)) {
+    m <- m_vals[mi]
+    mat[, mi] <- sim_power(m, pi0, q, N)
+  }
+  results[[as.character(pi0)]] <- mat
+}
+
+for (pi0 in names(results)) {
+  cat("\n=== pi0 =", pi0, "===\n")
+  print(round(results[[pi0]], 3))
+}
+```
+
+### FIGURE 6: Distribution of true and estimated lfdr + distribution of $\hat \pi_0$
+
+```{r}
+#| warning: false
+#| message: false
+set.seed(123)
+library(fdrtool)
+library(ggplot2)
+library(dplyr)
+library (patchwork)
+library(cowplot)
+
+calc_t_star <- function(q, pi0=0.75, k=5) {
+  "
+  oracle t* for alternating configuration
+  "
+  t_vals <- seq(1e-10, 1 - 1e-10, length.out = 10000)
+  lfdr_vals <- e_bayes_lfdr(t_vals, pi0)
+  idx <- sum(lfdr_vals <= q)
+  t_star <- t_vals[idx]
+  return(t_star)
+}
+
+evaluate_lfdr_at_cutoff <- function(m, pi0, q_grid = seq(0.1, 0.3, by = 0.05), N = 10000) {
+  
+  results <- data.frame(
+    proc = character(),
+    type = character(),
+    q = numeric(),
+    lfdr_value = numeric(),
+    pi0_hat = numeric(),
+    Oracle_cutoff = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (sim_i in seq_len(N)) {
+    sim <- freq_simulate_pvals(m, pi0)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    m0 <- round(pi0 * m)
+    
+    for (q in q_grid) {
+      
+      pi0_hat_vals <- list() 
+      cutoffs <- list()
+      
+      ## TSSL
+      rejs1 <- support_line(pvals, q)
+      m0_hat <- m - length(rejs1)
+      rejs <- support_line(pvals, q * m / m0_hat)
+      if (length(rejs) > 0) cutoffs$TSSL <- rejs[which.max(pvals[rejs])]
+      pi0_hat_vals$TSSL <- (m - length(rejs1)) / m
+      
+      ## Oracle
+      rejs <- support_line(pvals, q * m / m0)
+      if (length(rejs) > 0) cutoffs$Oracle <- rejs[which.max(pvals[rejs])]
+      pi0_hat_vals$Oracle <- m0 / m
+      
+      ## Storey
+      rejs <- storey_support_line(pvals, q)
+      if (length(rejs) > 0) cutoffs$Storey <- rejs[which.max(pvals[rejs])]
+      pi0_hat_vals$Storey <- storey_pi0(pvals)
+      
+      ## LSL
+      pi0_hat_lsl <- lsl_pi0(pvals)
+      rejs <- support_line(pvals, q / pi0_hat_lsl)
+      if (length(rejs) > 0) cutoffs$LSL <- rejs[which.max(pvals[rejs])]
+      pi0_hat_vals$LSL <- pi0_hat_lsl
+      
+      ## AS
+      lambda <- lambda_hat(pvals, q, 0.1)
+      rejs <- storey_support_line(pvals, q, lambda)
+      if (length(rejs) > 0) cutoffs$AS <- rejs[which.max(pvals[rejs])]
+      pi0_hat_vals$AS <- storey_pi0(pvals, lambda)
+      
+      t_star <- calc_t_star(q)
+      
+      for (proc in names(pi0_hat_vals)) {
+        pi0_hat_proc <- pi0_hat_vals[[proc]]
+        cutoff_idx_proc <- cutoffs[[proc]] 
+        if (is.na(pi0_hat_proc) || !is.finite(pi0_hat_proc) || is.null(cutoff_idx_proc)) {
+          lfdr_true <- 0
+          lfdr_estimated <- 0
+        }
+        else {
+          lfdr_true <- e_bayes_lfdr(pvals[cutoff_idx_proc], pi0)
+          lfdr_estimated <- lfdr_est(f_hat(pvals, t_star), pi0_hat_proc)
+          lfdr_est_individual_cutoff <- lfdr_est(f_hat(pvals, pvals), pi0_hat_proc)
+          }
+        results <- rbind(
+    results, 
+    data.frame(proc = proc, type = "True",
+               q = q, lfdr_value = lfdr_true,
+               pi0_hat = pi0_hat_proc),
+    data.frame(proc = proc, type = "Estimated t*",
+               q = q, lfdr_value = lfdr_estimated,
+               pi0_hat = pi0_hat_proc),
+    data.frame(proc = proc, type = "Estimated individual",
+               q = q, lfdr_value = lfdr_est_individual_cutoff,
+               pi0_hat = pi0_hat_proc)
+  )
+      }
+    }
+  }
+  
+  return(results)
+}
+
+
+results <- evaluate_lfdr_at_cutoff(
+  m = 64,
+  pi0 = 0.75,
+  q_grid = seq(0.05, 0.3, by = 0.05),
+  N = 10000
+)
+
+# Split data
+true_df <- subset(results, type == "True")
+est_df  <- subset(results, type == "Estimated t*")
+ind_df <- subset(results, type == "Estimated individual")
+# Compute means
+true_means <- true_df %>%
+  group_by(proc, q) %>%
+  summarise(mean_val = mean(lfdr_value), .groups = "drop")
+
+est_means <- est_df %>%
+  group_by(proc, q) %>%
+  summarise(mean_val = mean(lfdr_value), .groups = "drop")
+
+common_theme <- theme_minimal(base_size = 14) +
+  theme(
+    axis.text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    legend.position = "none"
+  )
+
+p1 <- ggplot(true_df, aes(x = factor(q), y = lfdr_value, fill = proc)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    position = position_dodge(width = 0.8),
+    coef = 0
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.6,
+    color = "white",
+    linewidth = 0.4,
+    position = position_dodge(width = 0.8)
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Tolerance level (q)",
+    y = "True Local FDR",
+    fill = "Procedure"
+  ) +
+  common_theme
+
+p2 <- ggplot(est_df, aes(x = factor(q), y = lfdr_value, fill = proc)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    position = position_dodge(width = 0.8),
+    coef = 0
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.6,
+    color = "white",
+    linewidth = 0.4,
+    position = position_dodge(width = 0.8)
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Tolerance level (q)",
+    y = "Estimated Local FDR",
+    fill = "Procedure"
+  ) +
+  common_theme
+
+pi0_df <- subset(results, proc != "Oracle")
+
+p3 <- ggplot(pi0_df, aes(x = factor(q), y = pi0_hat, fill = proc)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    position = position_dodge(width = 0.8),
+    coef = 0
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.6,
+    color = "white",
+    linewidth = 0.4,
+    position = position_dodge(width = 0.8)
+  ) +
+  coord_cartesian(ylim = c(0.6, 0.9)) +
+  labs(
+    x = "Tolerance level (q)",
+    y = expression(hat(pi)[0]),
+    fill = "Procedure"
+  ) +
+  common_theme
+
+p4 <- ggplot(ind_df, aes(x = factor(q), y = lfdr_value, fill = proc)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    position = position_dodge(width = 0.8),
+    coef = 0
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.6,
+    color = "white",
+    linewidth = 0.4,
+    position = position_dodge(width = 0.8)
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Tolerance level (q)",
+    y = "Estimated Local FDR (Individual Cutoffs)",
+    fill = "Procedure"
+  ) +
+  common_theme
+
+legend <- get_legend(
+  ggplot(true_df, aes(x = factor(q), y = lfdr_value, fill = proc)) +
+    geom_boxplot() +
+    labs(fill = "Procedure") +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.text = element_text(size = 14),
+      legend.title = element_text(size = 16)
+    )
+)
+
+p1
+p2
+p3
+p4
+plot(legend)
+
+```
+
+# Meta-data Anlysis
+
+### Load p-values
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(fdrtool)
+#merten
+#pvals <- readRDS("/Users/Sarah/Dropbox/My Mac (sarahms-air.lan)/Downloads/mertens_adjusted_pvals.rds")
+
+#macnamara
+pvals <- readRDS("/Users/Sarah/Dropbox/My Mac (sarahms-air.lan)/Downloads/macnamara_pvals.rds")
+m <- length(pvals)
+```
+
+### FIGURE 7: Histogram
+
+```{r}
+ggplot(data.frame(pval = pvals), aes(x = pval)) +
+  geom_histogram(binwidth = 0.025, fill = "steelblue", color = "white", boundary = 0) +
+  labs(
+    title = "p-val histogram",
+    x = "p-value",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 18)
+  )
+```
+
+### FIGURE 8: FDR across subsets of rejection set
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+q <- 0.1
+pi0_hat <- storey_pi0(pvals) 
+rejs <- bh(pvals, q / pi0_hat)
+
+R <- length(rejs)
+sorted_rejs <- rejs[order(pvals[rejs])]
+p_sorted <- pvals[sorted_rejs]
+first_half_idx  <- 1:floor(R/2)
+second_half_idx <- (floor(R/2)+1):R
+
+p_first  <- p_sorted[first_half_idx]
+p_second <- p_sorted[second_half_idx]
+
+t_all <- max(p_sorted)
+t1 <- max(p_first)
+t2 <- max(p_second)
+
+# Expected number of false discoveries
+ExpV_all <- m * pi0_hat * t_all
+ExpV1    <- m * pi0_hat * t1
+ExpV2    <- m * pi0_hat * (t2 - t1)
+
+FDR_all <- ExpV_all / R
+FDR_1   <- ExpV1 / max(length(p_first), 1)
+FDR_2   <- ExpV2 / max(length(p_second), 1)
+
+df_plot <- data.frame(
+  rank = 1:R,
+  p = p_sorted
+)
+
+# Whole secant line: (0,0) to (R, t_all)
+df_sec_all <- data.frame(
+  rank = c(0, R),
+  p = c(0, t_all),
+  group = "0.0914"
+)
+
+# First half secant: (0,0) to (R/2, t1)
+df_sec_1 <- data.frame(
+  rank = c(0, length(p_first)),
+  p = c(0, t1),
+  group = "0.0386"
+)
+
+# Second half secant: (R/2, t1) to (R, t2)
+df_sec_2 <- data.frame(
+  rank = c(length(p_first), R),
+  p = c(t1, t2),
+  group = "0.1404"
+)
+
+df_secants <- bind_rows(df_sec_all, df_sec_1, df_sec_2)
+
+ggplot() +
+  geom_point(data = df_plot, aes(x = rank, y = p), size = 1.3) +
+  geom_line(
+    data = df_secants,
+    aes(x = rank, y = p, color = group),
+    linewidth = 1.1
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 8)) +
+  scale_color_discrete(
+    labels = function(x) percent(as.numeric(x), accuracy =1)
+  ) +
+  labs(
+    title = "FDR estimates across subsets of rejection set",
+    x = "order statistic rank",
+    y = "p-value",
+    color = "FDR"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title  = element_text(size = 18, face = "plain"),
+    axis.title  = element_text(size = 16),
+    axis.text   = element_text(size = 14),
+    legend.title = element_text(size = 15),
+    legend.text  = element_text(size = 14)
+  )
+
+```
+
+### FIGURE 9: Callibration
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(fdrtool)
+library(knitr)
+library(cowplot)
+library(grid)
+q_vals <- c(0.1, 0.15, 0.2, 0.25, 0.3)
+pi0_storey <- storey_pi0(pvals)
+pi0_lsl    <- lsl_pi0(pvals)
+procedures   <- c("Storey", "LSL")
+
+f_hat_vec  <- f_hat(pvals, pvals)
+alpha_vec  <- calibration(pvals)
+
+results_df <- bind_rows(lapply(procedures, function(proc) {
+  bind_rows(lapply(q_vals, function(qv) {
+    pi0_hat <- if (proc == "Storey") pi0_storey else pi0_lsl
+
+    data.frame(
+      pval      = pvals,
+      lfdr      = lfdr_est(f_hat_vec, pi0_hat),
+      alpha_p   = alpha_vec,
+      procedure = proc,
+      q         = qv
+    )
+  }))
+}))
+
+compute_cutoff_table <- function(proc_name) {
+  df_proc <- results_df %>%
+    filter(procedure == proc_name) %>%
+    arrange(pval)
+
+  bind_rows(lapply(q_vals, function(qv) {
+    df_sub <- df_proc %>% filter(q == qv)
+    pi0_q <- if (proc_name == "Storey") pi0_storey else pi0_lsl
+
+    valid_idx <- which(df_sub$lfdr <= qv)
+    if (length(valid_idx) == 0) {
+      return(data.frame(
+        q = qv, cutoff_p_val = NA, p_match = NA,
+        LB = NA, UB = NA, pi0_hat_estimate = pi0_q
+      ))
+    }
+
+    idx <- max(valid_idx)
+    lfdr_cut <- df_sub$lfdr[idx]
+
+    match_idx <- which.min(abs(df_sub$lfdr - lfdr_cut))
+
+    data.frame(
+      q = qv,
+      cutoff_p_val = df_sub$pval[idx],
+      p_match      = df_sub$pval[match_idx],
+      alpha           = df_sub$alpha_p[match_idx],
+      lfdr           = lfdr_cut,
+      pi0_hat_estimate = pi0_q
+    )
+  }))
+}
+
+cutoff_tables <- lapply(procedures, compute_cutoff_table)
+names(cutoff_tables) <- procedures
+
+cutoff_plot_data <- bind_rows(
+  cutoff_tables$Storey %>% mutate(Procedure = "Storey"),
+  cutoff_tables$LSL %>% mutate(Procedure = "LSL")
+) %>%
+  filter(!is.na(cutoff_p_val))
+
+print(kable(cutoff_tables$Storey %>% dplyr::select(q, cutoff_p_val, p_match, alpha, lfdr),
+            digits = 4, caption = "Storey Procedure Cutoff Table"))
+print(kable(cutoff_tables$LSL %>% dplyr::select(q, cutoff_p_val, p_match, alpha, lfdr),
+            digits = 4, caption = "LSL Procedure Cutoff Table"))
+results_plot <- results_df %>%
+  filter(procedure %in% c("Storey", "LSL"))
+
+
+p_grid <- seq(min(pvals), max(pvals), length.out = 1000)
+f_hat_grid <- f_hat(pvals, p_grid)
+lfdr_storey_grid <- lfdr_est(f_hat_grid, pi0_storey)
+lfdr_lsl_grid    <- lfdr_est(f_hat_grid, pi0_lsl)
+alpha_half_grid   <- calibration(p_grid)
+alpha_storey_grid <- calibration_pi0hat(p_grid, pi0_storey)
+alpha_lsl_grid    <- calibration_pi0hat(p_grid, pi0_lsl)
+
+# Data for plotting smooth curves
+smooth_df <- bind_rows(
+  data.frame(p = p_grid, value = lfdr_storey_grid,
+             type = "lfdr", procedure = "Storey"),
+  data.frame(p = p_grid, value = lfdr_lsl_grid,
+             type = "lfdr", procedure = "LSL"),
+  data.frame(p = p_grid, value = alpha_storey_grid,
+             type = "cal_storey", procedure = "Storey"),
+  data.frame(p = p_grid, value = alpha_lsl_grid,
+             type = "cal_lsl", procedure = "LSL"),
+  data.frame(p = p_grid, value = alpha_half_grid,
+             type = "cal_half", procedure = "Half")
+)
+gg <- ggplot() +
+
+  # lfdr curves (solid)
+  geom_line(
+    data = smooth_df %>% filter(type == "lfdr"),
+    aes(x = p, y = value, color = procedure),
+    size = 1,
+    show.legend = FALSE
+  ) +
+
+  # Calibration lines (dashed)
+  geom_line(
+    data = smooth_df %>% filter(type == "cal_storey"),
+    aes(x = p, y = value, color = "storey_hat"),
+    size = 1,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    data = smooth_df %>% filter(type == "cal_lsl"),
+    aes(x = p, y = value, color = "lsl_hat"),
+    size = 1,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    data = smooth_df %>% filter(type == "cal_half"),
+    aes(x = p, y = value, color = "half"),
+    size = 1,
+    linetype = "dashed"
+  ) +
+
+  # Cutoff lines (nudged if overlapping)
+  geom_vline(
+    data = cutoff_plot_data %>% filter(Procedure == "Storey"),
+    aes(xintercept = cutoff_p_val),
+    color = "blue",
+    linetype = "dotted",
+    size = 1.2,
+    alpha = 0.8,
+    position = position_nudge(x = -0.0005),
+    show.legend = FALSE
+  ) +
+  geom_vline(
+    data = cutoff_plot_data %>% filter(Procedure == "LSL"),
+    aes(xintercept = cutoff_p_val),
+    color = "red",
+    linetype = "dotted",
+    size = 1.2,
+    alpha = 0.8,
+    position = position_nudge(x = 0.0005),
+    show.legend = FALSE
+  ) +
+
+  # Manual color scale
+  scale_color_manual(
+    name = "",
+    values = c(
+      "Storey"     = "blue",
+      "LSL"        = "red",
+      "storey_hat" = "blue",
+      "lsl_hat"    = "red",
+      "half"       = "black"
+    ),
+    breaks = c("lsl_hat", "storey_hat", "half"),
+    labels = c(
+      expression(hat(pi)[0]~"(LSL)"),
+      expression(hat(pi)[0]~"(Storey)"),
+      expression(pi[0] == 0.5)
+    )
+  ) +
+
+  guides(color = guide_legend(ncol = 1)) +
+
+  labs(x = "p-value", y = "local fdr") +
+
+  coord_cartesian(xlim = c(0, 0.2), ylim = c(0, 0.8)) +
+
+
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 16, color = "black"),
+    axis.text  = element_text(size = 14, color = "black"),
+    axis.line  = element_line(color = "black"),
+
+    panel.grid.major = element_line(color = "grey80", size = 0.5),
+    panel.grid.minor = element_line(color = "grey90", size = 0.3),
+
+    legend.position = "bottom",
+    legend.direction = "vertical"
+  )
+
+
+# Extract legend
+legend <- cowplot::get_legend(
+  gg +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "vertical"
+    ) +
+    guides(color = guide_legend(ncol = 1))
+)
+
+gg_no_legend <- gg + theme(legend.position = "none")
+
+
+print(gg_no_legend)
+grid::grid.newpage()
+grid::grid.draw(legend)
+
+```
+
+### TABLE 1: $\hat \pi_0$ estimates
+
+```{r}
+q_grid <- c(0.1, 0.2, 0.3)
+proc_names <- c("SL", "TSSL (q)", "TSSL (q')", "Storey (1/2)", "Storey (q)", "LSL", "AS_0.01", "AS_0.5_0.1", "AS_0.1")
+
+proc_res <- matrix(0, nrow = length(proc_names), ncol = length(q_grid))
+rownames(proc_res) <- proc_names
+colnames(proc_res) <- paste0("q=", q_grid)
+
+for (qi in seq_along(q_grid)) {
+  q <- q_grid[qi]
+  
+  # SL at level q
+  rejs <- support_line(pvals, q)
+  R1 <- length(rejs)
+  proc_res["SL", qi] <- 1
+  
+  # TSSL
+  rejs1 <- support_line(pvals, q)
+  m0_hat <- m - length(rejs1)
+  rejs <- support_line(pvals, q * m / m0_hat)
+  R1 <- length(rejs)
+  proc_res["TSSL (q)", qi] <- m0_hat / m
+  
+  #TSSL q'
+  q_prime <- q/ (1 + q)
+  rejs1 <- support_line(pvals, q_prime)
+  m0_hat <- m - length(rejs1)
+  rejs <- support_line(pvals, q_prime * m / m0_hat)
+  R1 <- length(rejs)
+  proc_res["TSSL (q')", qi] <- m0_hat / m
+  
+  # Storey 1/2
+  pi0_hat <- storey_pi0(pvals)
+  rejs <- storey_support_line(pvals, q)
+  R1 <- length(rejs)
+  proc_res["Storey (1/2)", qi] <- pi0_hat
+  
+  #Storey with lambda = q
+  pi0_hat <- storey_pi0(pvals, q)
+  rejs <- storey_support_line(pvals, q, q)
+  R1 <- length(rejs)
+  proc_res["Storey (q)", qi] <- pi0_hat
+  
+  # Procedure 4: LSL
+  pi0_hat <- lsl_pi0(pvals)
+  rejs <- support_line(pvals, q / pi0_hat)
+  R1 <- length(rejs)
+  proc_res["LSL", qi] <- pi0_hat
+  
+  # Procedure 5: AS with delta = 0.01
+  lambda <- lambda_hat(pvals, q, 0.01)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.01", qi] <- pi0_hat
+  
+  # Procedure 6: AS w/ lambda_hat starting at 0.5 and delta = 0.1
+  lambda <- lambda_hat(pvals, 0.5, 0.1)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.5_0.1", qi] <- pi0_hat
+  
+  #Procedure 7: AS with delta = 0.1
+  lambda <- lambda_hat(pvals, q, 0.1)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.1", qi]   <- pi0_hat
+
+}
+
+proc_table <- as.data.frame(proc_res)
+proc_table <- round(proc_table, 2)
+
+print(proc_table)
+```
+
+### TABLE 2: Number of rejections
+
+```{r}
+q_grid <- c(0.1, 0.2, 0.3)
+proc_names <- c("SL", "TSSL (q)", "TSSL (q')", "Storey (1/2)", "Storey (q)", "LSL", "AS_0.01", "AS_0.5_0.1", "AS_0.1")
+
+proc_res <- matrix(0, nrow = length(proc_names), ncol = length(q_grid))
+rownames(proc_res) <- proc_names
+colnames(proc_res) <- paste0("q=", q_grid)
+
+for (qi in seq_along(q_grid)) {
+  q <- q_grid[qi]
+  
+  # SL at level q
+  rejs <- support_line(pvals, q)
+  R1 <- length(rejs)
+  proc_res["SL", qi] <- R1
+  
+  # TSSL
+  rejs1 <- support_line(pvals, q)
+  m0_hat <- m - length(rejs1)
+  rejs <- support_line(pvals, q * m / m0_hat)
+  R1 <- length(rejs)
+  proc_res["TSSL (q)", qi] <- R1
+  
+  #TSSL q'
+  q_prime <- q/ (1 + q)
+  rejs1 <- support_line(pvals, q_prime)
+  m0_hat <- m - length(rejs1)
+  rejs <- support_line(pvals, q_prime * m / m0_hat)
+  R1 <- length(rejs)
+  proc_res["TSSL (q')", qi] <- R1
+  
+  # Storey 1/2
+  pi0_hat <- storey_pi0(pvals)
+  rejs <- storey_support_line(pvals, q)
+  R1 <- length(rejs)
+  proc_res["Storey (1/2)", qi] <- R1
+  
+  #Storey with lambda = q
+  pi0_hat <- storey_pi0(pvals, q)
+  rejs <- storey_support_line(pvals, q, q)
+  R1 <- length(rejs)
+  proc_res["Storey (q)", qi] <- R1
+  
+  # Procedure 4: LSL
+  pi0_hat <- lsl_pi0(pvals)
+  rejs <- support_line(pvals, q / pi0_hat)
+  R1 <- length(rejs)
+  proc_res["LSL", qi] <- R1
+  
+  # Procedure 5: AS with delta = 0.01
+  lambda <- lambda_hat(pvals, q, 0.01)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.01", qi] <- R1
+  
+  # Procedure 6: AS w/ lambda_hat starting at 0.5 and delta = 0.1
+  lambda <- lambda_hat(pvals, 0.5, 0.1)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.5_0.1", qi] <- R1
+  
+  #Procedure 7: AS with delta = 0.1
+  lambda <- lambda_hat(pvals, q, 0.1)
+  pi0_hat <- storey_pi0(pvals, lambda)
+  rejs <- storey_support_line(pvals, q, lambda)
+  R1 <- length(rejs)
+  proc_res["AS_0.1", qi]   <- R1
+
+}
+
+proc_table <- as.data.frame(proc_res)
+proc_table <- round(proc_table, 2)
+
+print(proc_table)
+```
+
+### 
