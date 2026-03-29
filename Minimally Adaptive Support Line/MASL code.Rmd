@@ -1,0 +1,618 @@
+---
+title: "MASL code"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+The code for the power tables and contour plots utilized the code from the following paper: Solari, A. and Goeman, J.J. (2017), Minimally adaptive BH: A tiny but uniform improvement of the procedure of Benjamini and Hochberg. Biom. J., 59: 776-780. <https://doi.org/10.1002/bimj.201500253>
+
+```{r}
+library(mvtnorm)
+library(xtable)
+
+alpha = 0.2  
+rho = 0
+
+R = matrix(c(1,rho,rho,1),ncol=2)
+R1 = matrix(c(1,rho - 1,rho - 1,2 - 2 * rho),ncol=2)
+c1 = qnorm(1-alpha)
+c2 = qnorm(1 - (alpha/2))
+
+
+mu1 <- mu2 <- seq(.5,3.5,by=.5) # (mu1,mu2) values
+mus = expand.grid(mu1,mu2)
+# Compute power to reject both hypotheses for SL and MASL
+pow.SL <- pow.MASL <- vector()
+for (i in 1:nrow(mus)){
+  mu = as.vector(mus[i,], "numeric")
+  m1 = mu[1]
+  m2 = mu[2]
+  
+  masl_integrand_1 <- function(z){
+    rv <- (pnorm(qnorm(1 - alpha), mean=m2 + rho * (z - m1), sd=sqrt(1 - rho^2)) - 
+                    pnorm(qnorm(pnorm(z) - alpha), mean=m2 + rho * (z - m1), sd=sqrt(1 - rho^2))) * 
+                   dnorm(z, mean=m1, sd=1)
+    return(rv)
+    }
+  
+  masl_integrand_2 <- function(z){
+    rv <- (pnorm(qnorm(1 - alpha), mean=m1 + rho * (z - m2), sd=sqrt(1 - rho^2)) - 
+                    pnorm(qnorm(pnorm(z) - alpha), mean=m1 + rho * (z - m2), sd=sqrt(1 - rho^2))) * 
+                   dnorm(z, mean=m2, sd=1)
+    return(rv)
+  }
+  
+  sl_integrand_1 <- function(z){
+    rv <- (pnorm(qnorm(pnorm(z) - alpha), mean=m2 + rho * (z - m1), sd=sqrt(1 - rho^2)) - 
+                    pnorm(qnorm(1 - alpha/2), mean=m2 + rho * (z - m1), sd=sqrt(1 - rho^2))) * 
+                   dnorm(z, mean=m1, sd=1)
+    return(rv)
+    }
+  
+  sl_integrand_2 <- function(z){
+    rv <- (pnorm(qnorm(pnorm(z) - alpha/2), mean=m1 + rho * (z - m2), sd=sqrt(1 - rho^2)) - 
+                    pnorm(qnorm(1 - alpha/2), mean=m1 + rho * (z - m2), sd=sqrt(1 - rho^2))) * 
+                   dnorm(z, mean=m2, sd=1)
+    return(rv)
+  }
+
+  pow.SL[i] = pmvnorm(lower=c(c1,c1), upper=Inf, mean=mu, corr=R)[1] 
+  
+  pow.MASL[i] = pmvnorm(lower=c(c1,c1), upper=Inf, mean=mu, corr=R)[1] + 
+  integrate(masl_integrand_1, lower = c2, upper = Inf, rel.tol = 1e-8)$value +
+   integrate(masl_integrand_2, lower = c2, upper = Inf, rel.tol = 1e-8)$value 
+}
+
+# Power (%) for rejecting both hypotheses for SL
+powmat.SL <- matrix(round(pow.SL*100,0), ncol=length(mu2))
+powmat.SL[upper.tri(powmat.SL)]<-""
+powmat.SL <- as.data.frame(powmat.SL)
+rownames(powmat.SL) <- mu1
+names(powmat.SL) <- mu2
+print(xtable(powmat.SL, caption = paste("Power (%) for rejecting both hypotheses for SL with correlation = ", rho)))
+
+# Power (%) for rejecting both hypotheses for MASL
+powmat.MASL <- matrix(round(pow.MASL*100,0), ncol=length(mu2))
+powmat.MASL[upper.tri(powmat.MASL)]<-""
+powmat.MASL <- as.data.frame(powmat.MASL)
+rownames(powmat.MASL) <- mu1
+names(powmat.MASL) <- mu2
+print(xtable(powmat.MASL, caption = paste("Power (%) for rejecting both hypotheses for MASL with correlation = ", rho)))
+
+```
+
+Turn table into heatmap
+
+```{r}
+library(mvtnorm)
+library(tidyverse)
+
+powmat.SL <- matrix(round(pow.SL * 100, 0),
+                    nrow = length(mu1),
+                    ncol = length(mu2),
+                    byrow = FALSE)
+
+powmat.MASL <- matrix(round(pow.MASL * 100, 0),
+                      nrow = length(mu1),
+                      ncol = length(mu2),
+                      byrow = FALSE)
+
+# Keep lower triangle only
+powmat.SL[upper.tri(powmat.SL)]     <- NA
+powmat.MASL[upper.tri(powmat.MASL)] <- NA
+
+rownames(powmat.SL)   <- mu1
+colnames(powmat.SL)   <- mu2
+rownames(powmat.MASL) <- mu1
+colnames(powmat.MASL) <- mu2
+
+df_SL <- as.data.frame(as.table(powmat.SL))
+colnames(df_SL) <- c("mu1","mu2","power")
+df_SL$procedure <- "SL"
+
+df_MASL <- as.data.frame(as.table(powmat.MASL))
+colnames(df_MASL) <- c("mu1","mu2","power")
+df_MASL$procedure <- "MASL"
+
+df_all <- bind_rows(df_SL, df_MASL)
+
+df_all$mu1 <- as.numeric(as.character(df_all$mu1))
+df_all$mu2 <- as.numeric(as.character(df_all$mu2))
+threshold <- median(df_all$power, na.rm = TRUE)
+
+ggplot(df_all,
+       aes(x = factor(mu2),
+           y = factor(mu1, levels = rev(sort(unique(mu1)))),
+           fill = power)) +
+  geom_tile(color = "white") +
+  geom_text(aes(
+      label = ifelse(is.na(power), "", power),
+      color = power < threshold
+  ),
+  size = 4) +
+  facet_wrap(~procedure) +
+  scale_fill_viridis_c(option = "C",
+                       na.value = "white") +
+  scale_color_manual(values = c("black", "white"), guide = "none") +
+  theme_minimal(base_size = 15) +
+  labs(
+    x = expression(mu[2]),
+    y = expression(mu[1]),
+    fill = "Power (%)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text  = element_text(face = "bold")
+  )
+```
+
+Contour map
+
+```{r}
+# Compute power odds ratio of MASL vs SL
+powmat.SL <- matrix(pow.SL, ncol=length(mu2))
+powmat.MASL <- matrix(pow.MASL, ncol=length(mu2))
+powmat.OR <-  powmat.MASL/powmat.SL * (1-powmat.SL)/(1-powmat.MASL)
+## ---- Create contour levels ----
+levs <- seq(min(powmat.OR),
+            max(powmat.OR),
+            length.out = 8)
+
+levs <- round(levs, 2)
+levs <- unique(levs)
+
+# ---- Colors ----
+cols <- viridisLite::viridis(length(levs))
+
+# ---- Square plotting region ----
+par(
+  mar = c(4,4,2,2),
+  pty = "s",
+  xaxs = "i",
+  yaxs = "i"
+)
+
+# ---- Contour plot ----
+contour(mu1,
+        mu2,
+        powmat.OR,
+        levels = levs,
+        col = cols,
+        lwd = 2,
+        labcex = 1.6,
+        asp = 1,
+        method = "edge",
+        xlab = expression(mu[1]),
+        ylab = expression(mu[2]),
+        cex.lab = 1.8,
+        cex.axis = 1.4)
+```
+
+$\hat \pi_0$ = 1 support line - explicitly calculated bFDR\
+
+$$
+Z =
+\begin{pmatrix}
+Z_1 \\
+Z_2
+\end{pmatrix}
+\sim
+N \left(
+\begin{pmatrix}
+0 \\
+0
+\end{pmatrix},
+\begin{pmatrix}
+1 & \rho \\
+\rho & 1
+\end{pmatrix}
+\right)
+$$
+
+$$
+\text{bFDR} = \mathbb{P}(R > 0) = 1 - \mathbb{P}(R = 0)
+$$
+
+$$
+\mathbb{P}(R = 0)
+=
+\mathbb{P}\left(
+\arg\min \left\{ p_{(k)} - \frac{\alpha k}{m} \right\} = 0
+\right)
+$$
+
+$$
+=
+\mathbb{P}\left(
+p_{(1)} > \frac{\alpha}{2}
+\;\cap\;
+p_{(2)} > \alpha
+\right)
+$$
+
+$$
+=
+\mathbb{P}\left(
+(p_1 > \tfrac{\alpha}{2},\, p_2 > \tfrac{\alpha}{2})
+\;\cap\;
+(p_1 > \alpha \;\text{or}\; p_2 > \alpha)
+\right)
+$$
+
+$$
+=
+\mathbb{P}\left(
+(p_1 > \alpha,\, p_2 > \tfrac{\alpha}{2})
+\;\cup\;
+(p_1 > \tfrac{\alpha}{2},\, p_2 > \alpha)
+\right)
+$$
+
+$$
+=
+\mathbb{P}\left(
+Z_1 < \Phi^{-1}(1-\alpha),
+\;
+Z_2 < \Phi^{-1}(1-\tfrac{\alpha}{2})
+\right)
+$$
+
+$$
++
+\mathbb{P}\left(
+Z_1 < \Phi^{-1}(1-\tfrac{\alpha}{2}),
+\;
+Z_2 < \Phi^{-1}(1-\alpha)
+\right)
+$$
+
+$$
+-\mathbb{P}\left(Z_1 < \Phi^{-1}(1-\alpha),\;Z_2 < \Phi^{-1}(1-\alpha)\right)
+$$
+
+```{r}
+library(mvtnorm)
+
+# Grid of rho values
+rho_vals <- seq(0, 1, by = 0.05)
+
+# q values
+q_vals <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+
+# Mean vector
+mu <- c(0, 0)
+
+# Function to compute bFDR for given rho and q when pi0 = 1
+compute_bfdr <- function(rho, q) {
+  c1 = qnorm(1-q)
+  c2 = qnorm(1 - (q/2))
+  
+  # correlation matrix
+  R = matrix(c(1,rho,rho,1),ncol=2)
+
+  A <- pmvnorm(lower = c(-Inf, -Inf),
+               upper = c(c1, c2),
+               mean = mu,
+               corr = R)[1] +
+       pmvnorm(lower = c(-Inf, -Inf),
+               upper = c(c2, c1),
+               mean = mu,
+               corr = R)[1] -
+       pmvnorm(lower = c(-Inf, -Inf),
+               upper = c(c1, c1),
+               mean = mu,
+               corr = R)[1]
+  
+  # bFDR
+  bfdr <- 1 - A
+  return(bfdr)
+}
+
+results <- expand.grid(rho = rho_vals, q = q_vals)
+
+results$bfdr <- mapply(compute_bfdr,
+                       rho = results$rho,
+                       q   = results$q)
+
+results$q <- factor(results$q)
+
+# Plot
+ggplot(results, aes(x = rho, y = bfdr, color = q)) +
+  geom_line(size = 1.2) +
+  labs(x = expression(rho),
+       y = "bFDR",
+       color = "q") +
+  theme_minimal(base_size = 14)
+```
+
+$\pi_0 = 1/2$ SL explicitly calculated bFDR
+
+```{r}
+library(mvtnorm)
+
+# Grid of rho values
+rho_vals <- seq(0, 1, by = 0.05)
+
+# q values
+q_vals <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+
+mu2_vals <- c(0.25, 0.5, 1, 2)
+
+# Function to compute bFDR for given rho and q when pi0 = 1
+compute_bfdr <- function(rho, q, mu2) {
+  mu <- c(0, mu2)
+  c1 = qnorm(1-q)
+  c2 = qnorm(1 - (q/2))
+  
+  integrand_1 <- function(z){
+  rv <- pnorm(qnorm(pnorm(z) - q/2),
+          mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2)) * dnorm(z)
+  return(rv)
+}
+  
+  integrand_2 <- function(z) {
+    rv <- (1 - pnorm(z, mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2))) * dnorm(z)
+    return(rv)
+  }
+  
+  integrand_3 <- function(z){
+  rv <- (pnorm(qnorm(pnorm(z) + q/2),
+          mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2)) - pnorm(z, mean = mu2 + rho * z, sd = sqrt(1 - rho^2))) * dnorm(z)
+  return(rv)
+}
+  
+  # correlation matrix
+  R = matrix(c(1,rho,rho,1),ncol=2)
+
+  bfdr <- integrate(integrand_1, lower = c2, upper = Inf, rel.tol = 1e-8)$value + integrate(integrand_2, lower = c2, upper = Inf, rel.tol = 1e-8)$value + integrate(integrand_3, lower = c1, upper = c2, rel.tol = 1e-8)$value
+  return(bfdr)
+}
+
+results <- expand.grid(rho = rho_vals, q = q_vals, mu2 = mu2_vals)
+
+results$bfdr <- mapply(compute_bfdr,
+                       rho = results$rho,
+                       q   = results$q,
+                       mu2 = results$mu2)
+
+results$q <- factor(results$q)
+
+# Plot with one panel per mu2
+ggplot(results, aes(x = rho, y = bfdr, color = q)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~mu2) +
+  labs(x = expression(rho),
+       y = "SL bFDR",
+       color = "q") +
+  theme_minimal(base_size = 14)
+```
+
+$\pi_0 = 1/2$ MASL explicitly calculated bFDR
+
+```{r}
+library(mvtnorm)
+
+# Grid of rho values
+rho_vals <- seq(0, 1, by = 0.05)
+
+# q values
+q_vals <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+
+mu2_vals <- c(0.25, 0.5, 1, 2)
+
+# Function to compute bFDR for given rho and q when pi0 = 1
+compute_bfdr <- function(rho, q, mu2) {
+  mu <- c(0, mu2)
+  c1 = qnorm(1-q)
+  c2 = qnorm(1 - (q/2))
+  c3 = qnorm(1 - (3*q/2))
+  
+  integrand_1 <- function(z){
+  rv <- pnorm(qnorm(pnorm(z) - q),
+          mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2)) * dnorm(z)
+  return(rv)
+  }
+  
+  integrand_2 <- function(z){
+  rv <- (1 - pnorm(z, mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2))) * dnorm(z)
+  return(rv)
+  }
+  
+  integrand_3 <- function(z){
+  rv <- (pnorm(qnorm(pnorm(z) + q),
+          mean = mu2 + rho * z,
+          sd = sqrt(1 - rho^2)) - pnorm(qnorm(1 - q/2), mean = mu2 + rho * z, sd = sqrt(1 - rho^2))) * dnorm(z)
+  return(rv)
+}
+  
+  # correlation matrix
+  R = matrix(c(1,rho,rho,1),ncol=2)
+
+  bfdr <- integrate(integrand_1, lower = c2, upper = Inf, rel.tol = 1e-8)$value + integrate(integrand_2, lower = c1, upper = Inf, rel.tol = 1e-8)$value + integrate(integrand_3, lower = c3, upper = c1, rel.tol = 1e-8)$value
+  return(bfdr)
+}
+
+results <- expand.grid(rho = rho_vals, q = q_vals, mu2 = mu2_vals)
+
+results$bfdr <- mapply(compute_bfdr,
+                       rho = results$rho,
+                       q   = results$q,
+                       mu2 = results$mu2)
+
+results$q <- factor(results$q)
+
+# Plot with one panel per mu2
+ggplot(results, aes(x = rho, y = bfdr, color = q)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~mu2) +
+  labs(x = expression(rho),
+       y = "MASL bFDR",
+       color = "q") +
+  theme_minimal(base_size = 14)
+```
+
+Functions for simulations
+
+```{r}
+
+simulate_correlated_pvals <- function(mu2, rho) {
+  mu_vec <- c(0, mu2)
+  Sigma <- matrix(c(1, rho, rho, 1), ncol=2)
+  Y <- mvrnorm(n = 1, mu = mu_vec, Sigma = Sigma)
+  pvals <- pnorm(Y, lower.tail = FALSE)
+  return(list(pvals = pvals, is_null = (mu_vec == 0)))
+}
+
+support_line <- function(pvals, alpha) {
+  "
+  Support line proceudre at tolerance level alpha
+  
+  "
+  m <- length(pvals)
+  p_sorted <- sort(pvals)
+  p_ext <- c(0, p_sorted)
+  scores <- p_ext - (alpha * 0:m) / m
+  k <- which.min(scores) -1
+  if (k == 0) return(integer(0))
+  threshold <- p_sorted[k]
+  return(which(pvals <= threshold))
+}
+
+masl <- function(pvals, alpha) {
+  m <- length(pvals)
+  R <- support_line(pvals, alpha)
+  if(length(R) == 0) {return(integer(0))}
+  else {return(support_line(pvals, alpha * m / (m - 1)))}
+}
+```
+
+$\pi_0 = 1/2$ MASL simulation
+
+```{r}
+library(mvtnorm)
+library(ggplot2)
+library(MASS)
+set.seed(123)
+
+
+N <- 10000
+q_vals <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+rho_vals <- seq(0, 1, by = 0.1)
+mu_vals <- c(0.25, 0.5, 1, 2)
+results <- expand.grid(
+  rho = rho_vals,
+  q = q_vals,
+  mu2 = mu_vals
+)
+
+results$bfdr <- 0
+
+for (i in 1:nrow(results)) {
+  
+  rho <- results$rho[i]
+  q   <- results$q[i]
+  mu2 <- results$mu2[i]
+  
+  last_null_count <- 0
+  
+  for (j in 1:N) {
+    
+    sim <- simulate_correlated_pvals(mu2, rho)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    
+    R <- masl(pvals, q)
+    
+    if (length(R) > 0) {
+      # last rejection = largest p-value among rejections
+      last_rej <- R[which.max(pvals[R])]
+      
+      if (is_null[last_rej]) {
+        last_null_count <- last_null_count + 1
+      }
+    }
+  }
+  
+  results$bfdr[i] <- last_null_count / N
+}
+
+# Plot
+ggplot(results, aes(x = rho, y = bfdr, color = factor(q))) +
+  geom_line(size = 1) +
+  facet_wrap(~ mu2) +
+  labs(
+    title = "MASL bFDR (simulation)",
+    x = expression(rho),
+    y = "MASL bFDR",
+    color = "q"
+  ) +
+  theme_minimal()
+```
+
+$\hat \pi_0 = 1/2$ SL simulation
+
+```{r}
+library(mvtnorm)
+library(ggplot2)
+library(MASS)
+set.seed(123)
+
+N <- 10000
+q_vals <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+rho_vals <- seq(0, 1, by = 0.1)
+mu_vals <- c(0.25, 0.5, 1, 2)
+results <- expand.grid(
+  rho = rho_vals,
+  q = q_vals,
+  mu2 = mu_vals
+)
+
+results$bfdr <- 0
+
+for (i in 1:nrow(results)) {
+  
+  rho <- results$rho[i]
+  q   <- results$q[i]
+  mu2 <- results$mu2[i]
+  
+  last_null_count <- 0
+  
+  for (j in 1:N) {
+    
+    sim <- simulate_correlated_pvals(mu2, rho)
+    pvals <- sim$pvals
+    is_null <- sim$is_null
+    
+    R <- support_line(pvals, q)
+    
+    if (length(R) > 0) {
+      # last rejection = largest p-value among rejections
+      last_rej <- R[which.max(pvals[R])]
+      
+      if (is_null[last_rej]) {
+        last_null_count <- last_null_count + 1
+      }
+    }
+  }
+  
+  results$bfdr[i] <- last_null_count / N
+}
+
+# Plot
+ggplot(results, aes(x = rho, y = bfdr, color = factor(q))) +
+  geom_line(size = 1) +
+  facet_wrap(~ mu2) +
+  labs(
+    title = "SL bFDR (simulation)",
+    x = expression(rho),
+    y = "SL bFDR",
+    color = "q"
+  ) +
+  theme_minimal()
+```
